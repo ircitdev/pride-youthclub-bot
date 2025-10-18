@@ -19,6 +19,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from dotenv import load_dotenv
 from datetime import timedelta
+from yookassa import Configuration, Payment
+import uuid
 
 def parse_period(arg: str):
     if arg == "today":
@@ -56,6 +58,12 @@ for adm in ADMINS_RAW.split(","):
         ADMINS.add(int(adm))
     else:
         ADMINS.add(adm)
+
+# YooKassa
+YOOKASSA_SHOP_ID = os.getenv("YOOKASSA_SHOP_ID")
+YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY")
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_SECRET_KEY
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger("pride-bot")
@@ -627,6 +635,156 @@ async def subscribe_cmd(m: Message):
         [InlineKeyboardButton(text="12 месяцев — 8910₽ (-25%)", callback_data="pay:12")],
     ])
     await m.answer(text, reply_markup=kb)
+
+
+# ================== YOOKASSA PAYMENT HANDLERS ==================
+@dp.callback_query(F.data.startswith("pay:"))
+async def process_payment(call: types.CallbackQuery):
+    """Создание платежа в YooKassa"""
+    period = call.data.split(":")[1]
+
+    # Определяем цену и описание
+    if period == "1":
+        price = 990
+        label = "1 месяц"
+    elif period == "3":
+        price = 2673
+        label = "3 месяца (-10%)"
+    else:
+        price = 8910
+        label = "12 месяцев (-25%)"
+
+    try:
+        # Создаём платёж в YooKassa
+        idempotence_key = str(uuid.uuid4())
+        payment = Payment.create({
+            "amount": {
+                "value": f"{price:.2f}",
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": "https://t.me/PRIDEyouthClub_bot"
+            },
+            "capture": True,
+            "description": f"Подписка Pride YouthClub - {label}",
+            "metadata": {
+                "user_id": str(call.from_user.id),
+                "username": call.from_user.username or "",
+                "period": period,
+                "tariff": label
+            }
+        }, idempotence_key)
+
+        log.info(f"Payment created: {payment.id} for user {call.from_user.id}, amount {price}")
+
+        # Логируем в Google Sheets со статусом "pending"
+        log_payment(call.from_user, label, price, period, None, "pending")
+
+        # Отправляем пользователю ссылку на оплату
+        text = (
+            f"💳 Тариф: {label}\n"
+            f"Сумма: {fmt_cur(price)}₽\n\n"
+            f"🔗 Перейдите по ссылке для оплаты через ЮKassa:\n"
+            f"{payment.confirmation.confirmation_url}\n\n"
+            f"После оплаты вы автоматически получите доступ к закрытой группе."
+        )
+
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Оплатить через ЮKassa", url=payment.confirmation.confirmation_url)],
+            [InlineKeyboardButton(text="✅ Проверить оплату", callback_data=f"check_payment:{payment.id}")]
+        ])
+
+        await call.message.answer(text, reply_markup=kb)
+        await call.answer()
+
+    except Exception as e:
+        log.error(f"Error creating payment: {e}")
+        await call.message.answer(
+            "❌ Ошибка при создании платежа. Пожалуйста, попробуйте позже или обратитесь в поддержку."
+        )
+        await call.answer()
+
+
+@dp.callback_query(F.data.startswith("check_payment:"))
+async def check_payment(call: types.CallbackQuery):
+    """Проверка статуса платежа"""
+    payment_id = call.data.split(":", 1)[1]
+
+    try:
+        payment = Payment.find_one(payment_id)
+
+        if payment.status == "succeeded" and payment.paid:
+            # Платёж успешен
+            metadata = payment.metadata
+            period = metadata.get("period", "1")
+            tariff = metadata.get("tariff", "1 месяц")
+            price = float(payment.amount.value)
+
+            # Обновляем статус в Google Sheets
+            log_payment(call.from_user, tariff, int(price), period, None, "success")
+
+            # Определяем реферера
+            rows = WS_USERS.get_all_records()
+            ref_source = None
+            for r in reversed(rows):
+                if str(r.get("user_id")) == str(call.from_user.id) and r.get("ref_source") and r["ref_source"] != "direct":
+                    ref_source = r["ref_source"]
+                    break
+
+            # Уведомление в админ-чат
+            uname = f"@{call.from_user.username}" if call.from_user.username else call.from_user.full_name
+            admin_text = (
+                f"💳 <b>Оплата успешна!</b>\n"
+                f"👤 Покупатель: {uname}\n"
+                f"Тариф: {tariff}\n"
+                f"Сумма: <b>{fmt_cur(int(price))}₽</b>\n"
+                f"Реферал: {ref_source if ref_source else '—'}\n"
+                f"Payment ID: {payment_id}"
+            )
+            await notify_admin_text(admin_text)
+
+            # Начисляем бонус рефералу (25%)
+            if ref_source:
+                ref_user_id, ref_username = get_user_id_by_ref(ref_source)
+                try:
+                    bonus = int(price * 0.25)
+                    log_referrer_bonus(ref_user_id or ref_source, ref_username or (ref_source if ref_source.startswith("@") else ""), bonus, f"Комиссия 25% от оплаты {tariff}")
+                    update_bonuses(ref_source, bonus)
+
+                    if ref_user_id:
+                        await bot.send_message(
+                            int(ref_user_id),
+                            f"🎉 Ура! Пользователь {uname} оплатил подписку.\n"
+                            f"💰 Тебе начислено <b>+{fmt_cur(bonus)}</b> бонусов (25% от суммы)."
+                        )
+                except Exception as e:
+                    log.error(f"Ошибка начисления бонуса рефералу {ref_source}: {e}")
+
+            # Отправляем покупателю ссылку на группу
+            await call.message.answer(
+                "✅ Оплата прошла успешно!\n\n"
+                f"Вот ссылка для вступления в закрытую группу:\n{CLOSED_CHAT_LINK}\n\n"
+                "Добро пожаловать в Pride YouthClub! 🎉"
+            )
+            await call.answer("Оплата подтверждена ✅")
+
+        elif payment.status == "canceled":
+            await call.message.answer("❌ Платёж отменён.")
+            await call.answer("Платёж отменён")
+
+        elif payment.status == "pending":
+            await call.message.answer("⏳ Платёж ещё обрабатывается. Попробуйте проверить позже.")
+            await call.answer("Платёж в обработке...")
+
+        else:
+            await call.message.answer(f"ℹ️ Статус платежа: {payment.status}")
+            await call.answer()
+
+    except Exception as e:
+        log.error(f"Error checking payment {payment_id}: {e}")
+        await call.message.answer("❌ Ошибка проверки платежа. Попробуйте позже.")
+        await call.answer()
 
 
 # ================== MAIN ==================

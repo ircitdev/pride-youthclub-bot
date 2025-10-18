@@ -5,6 +5,7 @@
 service_account.json
 *.key
 *.pem
+secret_key.txt
 
 # Python
 __pycache__/
@@ -45,6 +46,8 @@ env/
 *.swo
 *~
 .DS_Store
+.claude/
+.cursor/
 
 # Логи и БД
 *.log
