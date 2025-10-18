@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python:*)",
+      "Bash(pip install:*)",
+      "Bash(w32tm /resync:*)",
+      "Bash(chmod:*)",
+      "Bash(docker build:*)",
+      "Bash(awk:*)",
+      "Bash(git init:*)",
+      "Bash(git config:*)",
+      "Bash(cat:*)",
+      "Bash(git add:*)"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}

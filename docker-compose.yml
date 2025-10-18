@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  pride-bot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pride-youthclub-bot
+    restart: unless-stopped
+
+    # Переменные окружения из .env файла
+    env_file:
+      - .env
+
+    # Монтируем файлы (только для чтения где возможно)
+    volumes:
+      - ./service_account.json:/app/service_account.json:ro
+      - ./youthsecret.pdf:/app/youthsecret.pdf:ro
+      - ./bukina.jpg:/app/bukina.jpg:ro
+      - ./logs:/app/logs
+
+    # Логирование
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Healthcheck (опционально)
+    healthcheck:
+      test: ["CMD-SHELL", "pgrep -f 'python pride-youthclub-bot.py' || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+    # Сеть
+    networks:
+      - bot-network
+
+networks:
+  bot-network:
+    driver: bridge
