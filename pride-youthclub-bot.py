@@ -6,6 +6,9 @@ from collections import defaultdict
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import (
     Message, BotCommand,
     InlineKeyboardMarkup, InlineKeyboardButton,
@@ -122,6 +125,134 @@ WS_USERS = SHEETS.worksheet("Users")
 WS_LINKS = SHEETS.worksheet("InviteLinks")
 WS_BONUSES = SHEETS.worksheet("Bonuses")
 WS_PAYMENTS = SHEETS.worksheet("Payments")
+
+# ================== UTM Labels / Метки ==================
+def ensure_label_worksheet(label: str):
+    """
+    Создает вкладку по метке если её нет.
+    Структура: Время перехода | Имя | Username | Telegram ID | Метка | Статус
+    """
+    try:
+        ws = SHEETS.worksheet(label)
+    except:
+        ws = SHEETS.add_worksheet(label, 1000, 6)
+        ws.update("A1:F1", [[
+            "Время перехода", "Имя пользователя", "Username",
+            "Telegram ID", "Метка", "Статус"
+        ]])
+    return ws
+
+def check_user_in_label(label: str, user_id: int) -> bool:
+    """Проверяет, есть ли пользователь уже в таблице метки"""
+    try:
+        ws = SHEETS.worksheet(label)
+        records = ws.get_all_records()
+        for r in records:
+            if str(r.get("Telegram ID", "")) == str(user_id):
+                return True
+    except:
+        pass
+    return False
+
+def log_label_user(label: str, user, is_top10: bool) -> bool:
+    """
+    Записывает пользователя во вкладку метки.
+    Возвращает True если пользователь был добавлен, False если уже был в таблице.
+    """
+    # Проверка на дубликат
+    if check_user_in_label(label, user.id):
+        return False
+
+    ws = ensure_label_worksheet(label)
+    status = "первый 10" if is_top10 else "обычный"
+    ws.append_row([
+        now(),
+        user.full_name,
+        user.username or "",
+        user.id,
+        label,
+        status
+    ], value_input_option="USER_ENTERED")
+    return True
+
+def count_label_users(label: str) -> int:
+    """Подсчитывает количество пользователей с данной меткой"""
+    try:
+        ws = SHEETS.worksheet(label)
+        records = ws.get_all_records()
+        return len(records)
+    except:
+        return 0
+
+def ensure_friend_worksheet(base_label: str):
+    """
+    Создает вкладку {{utm1}}_friend для приглашенных друзей.
+    Структура: Время | Кто пригласил | Кого пригласил | Имя | Статус
+    """
+    friend_label = f"{base_label}_friend"
+    try:
+        ws = SHEETS.worksheet(friend_label)
+    except:
+        ws = SHEETS.add_worksheet(friend_label, 1000, 5)
+        ws.update("A1:E1", [[
+            "Время приглашения", "Кто пригласил (ID/username)",
+            "Кого пригласил (ID)", "Имя пользователя", "Статус"
+        ]])
+    return ws
+
+def log_friend_invitation(base_label: str, inviter_id: int, inviter_username: str, invited_user):
+    """Записывает приглашение друга во вкладку {{utm1}}_friend"""
+    ws = ensure_friend_worksheet(base_label)
+
+    # Проверяем, есть ли уже приглашенный в этой таблице
+    records = ws.get_all_records()
+    status = "уже в базе"
+    for r in records:
+        if str(r.get("Кого пригласил (ID)", "")) == str(invited_user.id):
+            status = "уже в базе"
+            return False
+
+    status = "новый"
+    inviter = f"{inviter_username}" if inviter_username else str(inviter_id)
+
+    ws.append_row([
+        now(),
+        inviter,
+        invited_user.id,
+        invited_user.full_name,
+        status
+    ], value_input_option="USER_ENTERED")
+    return True
+
+def parse_label(label_str: str):
+    """
+    Парсит метку формата:
+    - pridefit -> (pridefit, None, None)
+    - pridefit_friend_f123456 -> (pridefit, 123456, username)
+    Возвращает (base_label, inviter_id, inviter_username)
+    """
+    if not label_str:
+        return None, None, None
+
+    parts = label_str.split("_friend_f")
+    if len(parts) == 2:
+        base_label = parts[0]
+        inviter_id = parts[1]
+        return base_label, inviter_id, None
+    else:
+        return label_str, None, None
+
+def get_user_original_label(user_id: int) -> str:
+    """Получает оригинальную метку пользователя из Users"""
+    rows = WS_USERS.get_all_records()
+    for r in reversed(rows):
+        if str(r.get("user_id")) == str(user_id) and r.get("action") == "started":
+            ref = r.get("ref_source", "")
+            if ref and ref != "direct":
+                # Извлекаем базовую метку
+                base_label, _, _ = parse_label(ref)
+                return base_label
+    return None
 
 # ================== Helpers ==================
 def now():
@@ -251,9 +382,14 @@ def log_payment(user, tariff, price, period, ref_source, status="success"):
         "yes"
     ], value_input_option="USER_ENTERED")
 
+# ================== States for Admin ==================
+class BroadcastStates(StatesGroup):
+    waiting_for_message = State()
+
 # ================== Bot ==================
 bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode="HTML"))
-dp = Dispatcher()
+storage = MemoryStorage()
+dp = Dispatcher(storage=storage)
 
 
 @dp.callback_query(F.data == "trainers")
@@ -276,29 +412,187 @@ async def trainers_cmd(m: Message):
 @dp.message(CommandStart())
 async def start(m: Message):
     payload = m.text.split(maxsplit=1)
-    ref = payload[1].strip() if len(payload) > 1 else None
+    label = payload[1].strip() if len(payload) > 1 else None
+    user = m.from_user
 
-    if ref:
-        # фиксируем факт старта по реферальной ссылке (без бонуса)
-        append_user_event(m.from_user, ref, "started", "bot", 0)
+    # Парсим метку: может быть обычная (pridefit) или friend (pridefit_friend_f123456)
+    base_label, inviter_id, inviter_username = parse_label(label)
 
-    # PDF
+    # Если это friend-ссылка
+    if inviter_id:
+        # Логируем приглашение друга
+        log_friend_invitation(base_label, inviter_id, inviter_username, user)
+        # Используем базовую метку для дальнейшей логики
+        label = base_label
+
+    # Если есть метка (UTM параметр)
+    is_top10 = False
+    if label:
+        # Подсчитываем количество пользователей с этой меткой
+        current_count = count_label_users(label)
+        is_top10 = current_count < 10
+
+        # Логируем в вкладку метки (с антидублированием)
+        log_label_user(label, user, is_top10)
+
+        # Логируем в общую вкладку Users
+        append_user_event(user, label, "started", "bot", 0)
+
+    # Отправляем welcome.jpg если есть
+    first_name = user.first_name or user.full_name
     try:
-        pdf_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "youthsecret.pdf")
-        if os.path.exists(pdf_path):
-            file = FSInputFile(pdf_path, filename="youthsecret.pdf")
-            await m.answer_document(file, caption="Диагностика морфотипа лица")
-    except Exception as e:
-        log.error(f"Не удалось отправить PDF: {e}")
+        img_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "welcome.jpg")
+        if os.path.exists(img_path):
+            photo = FSInputFile(img_path, filename="welcome.jpg")
 
-    # Главное меню
+            # Приветственное сообщение (обновленный текст)
+            greeting = (
+                f"💫 Привет, {first_name}!\n\n"
+                f"Рада видеть тебя 🌸\n"
+                f"Я — Мария Букина, тренер по фейсфитнесу и автор клуба «Омоложения ПРАЙД».\n\n"
+                f"Здесь мы возвращаем молодость естественным способом — без уколов, без фанатизма и без лишних обещаний 💖\n\n"
+                f"Чтобы получить 🎁 бесплатный видео-урок\n"
+                f"👇 подпишись на наш канал:\n"
+                f"👉 <a href='https://t.me/PRIDEyouthClubChannel'>Клуб Омоложения ПРАЙД</a>\n\n"
+                f"После подписки нажми кнопку «✅ Я подписалась» — и я пришлю тебе видео 💎"
+            )
+
+            # Бонусное сообщение для первых 10
+            if label and is_top10:
+                greeting += (
+                    f"\n\n🎉 {first_name}, тебе повезло!\n"
+                    f"Ты вошла в число первых 10 участниц,\n"
+                    f"которым Мария лично проведёт короткую консультацию 💬\n\n"
+                    f"Она свяжется с тобой в ближайшее время 💖"
+                )
+
+            # Кнопки
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🔗 Подписаться на канал", url="https://t.me/PRIDEyouthClubChannel")],
+                [InlineKeyboardButton(text="✅ Я подписалась", callback_data=f"check_sub_new:{label or 'direct'}")]
+            ])
+
+            await m.answer_photo(photo, caption=greeting, reply_markup=kb)
+            return
+    except Exception as e:
+        log.error(f"Ошибка отправки welcome.jpg: {e}")
+
+    # Если нет картинки - отправляем текстом
+    greeting = (
+        f"💫 Привет, {first_name}!\n\n"
+        f"Рада видеть тебя 🌸\n"
+        f"Я — Мария Букина, тренер по фейсфитнесу и автор клуба «Омоложения ПРАЙД».\n\n"
+        f"Здесь мы возвращаем молодость естественным способом — без уколов, без фанатизма и без лишних обещаний 💖\n\n"
+        f"Чтобы получить 🎁 бесплатный видео-урок\n"
+        f"👇 подпишись на наш канал:\n"
+        f"👉 <a href='https://t.me/PRIDEyouthClubChannel'>Клуб Омоложения ПРАЙД</a>\n\n"
+        f"После подписки нажми кнопку «✅ Я подписалась» — и я пришлю тебе видео 💎"
+    )
+
+    if label and is_top10:
+        greeting += (
+            f"\n\n🎉 {first_name}, тебе повезло!\n"
+            f"Ты вошла в число первых 10 участниц,\n"
+            f"которым Мария лично проведёт короткую консультацию 💬\n\n"
+            f"Она свяжется с тобой в ближайшее время 💖"
+        )
+
     kb = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="📢 Перейти в канал", url="https://t.me/PRIDEyouthClubChannel")],
-    [InlineKeyboardButton(text="🔒 Закрытая группа", callback_data="closed_group")],
-    [InlineKeyboardButton(text="🤝 Позвать подруг", callback_data="invitebtn")],
-    [InlineKeyboardButton(text="👩‍🏫 О тренерах", callback_data="trainers")],
+        [InlineKeyboardButton(text="🔗 Подписаться на канал", url="https://t.me/PRIDEyouthClubChannel")],
+        [InlineKeyboardButton(text="✅ Я подписалась", callback_data=f"check_sub_new:{label or 'direct'}")]
     ])
-    await m.answer("Подпишись на канал и оформи доступ в закрытую группу 👇", reply_markup=kb)
+
+    await m.answer(greeting, reply_markup=kb)
+
+# --- Проверка подписки (новая логика с видео) ---
+@dp.callback_query(F.data.startswith("check_sub_new:"))
+async def check_subscription_new(call: types.CallbackQuery):
+    """Проверяет подписку, отправляет видео и финальное CTA"""
+    label = call.data.split(":", 1)[1]
+    user = call.from_user
+    first_name = user.first_name or user.full_name
+
+    try:
+        member = await bot.get_chat_member(OPEN_CHANNEL_ID, user.id)
+        if member.status not in ["member", "administrator", "creator"]:
+            # Не подписан
+            await call.message.answer(
+                f"❗Пока не вижу тебя среди подписчиков, {first_name} 💌\n"
+                f"Подпишись, чтобы получить видео и начать путь к естественному омоложению 🌸\n"
+                f"👉 <a href='https://t.me/PRIDEyouthClubChannel'>Перейти в канал</a>"
+            )
+            await call.answer()
+            return
+    except Exception as e:
+        log.warning(f"Ошибка проверки подписки: {e}")
+        await call.message.answer(
+            "⚠️ Не удалось проверить подписку. Убедись, что бот является администратором канала."
+        )
+        await call.answer()
+        return
+
+    # Пользователь подписан
+    await call.message.answer(
+        f"🌿 Отлично, {first_name}!\n"
+        f"Ты теперь часть сообщества, где молодость — не в паспорте, а в отражении 💫\n\n"
+        f"Как и обещала — держи 🎥 мой видео-урок:\n"
+        f"👉 <b>«Что такое современный фейс-фитнес»</b>\n"
+        f"(видео появится ниже 👇)"
+    )
+
+    # Отправка видео leadmagnit (mp4 или MOV)
+    try:
+        base_path = os.path.dirname(os.path.abspath(__file__))
+        video_path = None
+
+        # Проверяем разные форматы
+        for ext in [".mp4", ".MOV", ".mov", ".MP4"]:
+            test_path = os.path.join(base_path, f"leadmagnit{ext}")
+            if os.path.exists(test_path):
+                video_path = test_path
+                break
+
+        if video_path:
+            video = FSInputFile(video_path, filename=os.path.basename(video_path))
+            await call.message.answer_video(video, caption="🎥 Что такое современный фейс-фитнес")
+        else:
+            log.error("Файл leadmagnit не найден (искал: .mp4, .MOV, .mov, .MP4)")
+            await call.message.answer("⚠️ Видео временно недоступно. Попробуйте позже.")
+    except Exception as e:
+        log.error(f"Ошибка отправки видео: {e}")
+
+    # Финальное CTA через 5 минут (300 секунд)
+    await asyncio.sleep(300)
+
+    # Получаем оригинальную метку пользователя для генерации friend-ссылки
+    user_label = get_user_original_label(user.id)
+    me = await bot.me()
+
+    if user_label:
+        # Генерируем friend-ссылку
+        friend_link = f"https://t.me/{me.username}?start={user_label}_friend_f{user.id}"
+    else:
+        friend_link = f"https://t.me/{me.username}"
+
+    await call.message.answer(
+        f"💖 {first_name}, как тебе видео?\n"
+        f"Чувствуешь, что молодость действительно можно вернуть без уколов и процедур? 🌸\n\n"
+        f"Если тебе откликнулось — поделись этим открытием с подругами 💬\n"
+        f"Пусть и они узнают, что можно выглядеть моложе, не тратя состояния на косметологов!\n\n"
+        f"👭 В «Клубе Омоложения ПРАЙД» мы вдохновляем друг друга —\n"
+        f"и именно это делает путь к себе лёгким и приятным 💫\n\n"
+        f"👇 Пригласи подругу — пусть она тоже получит бесплатный видео-урок 💎\n\n"
+        f"🔗 Твоя ссылка для друзей:\n{friend_link}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔗 Пригласить подруг", url=friend_link)]
+        ])
+    )
+
+    # Логируем подписку с бонусом (если был реферал)
+    if label and label != "direct":
+        append_user_event(user, label, "subscribed", "channel", CHANNEL_BONUS)
+
+    await call.answer()
 
 # --- Кнопка "Закрытая группа" ---
 @dp.callback_query(F.data == "closed_group")
@@ -551,6 +845,186 @@ async def debugsub(m: Message):
 
     await m.answer("\n".join(text))
 
+# ================== ADMIN PANEL ==================
+@dp.message(Command("admin"))
+async def admin_panel(m: Message):
+    """Админ-панель"""
+    if not is_admin(m.from_user):
+        await m.answer("⛔️ У вас нет доступа к админ-панели.")
+        return
+
+    # Подсчитываем пользователей
+    all_users = set()
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        user_id = r.get("user_id")
+        if user_id:
+            all_users.add(str(user_id))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📢 Массовая рассылка", callback_data="admin_broadcast")],
+        [InlineKeyboardButton(text=f"👥 Количество подписчиков: {len(all_users)}", callback_data="admin_users")],
+        [InlineKeyboardButton(text="📊 Метки и статистика", callback_data="admin_stats")],
+        [InlineKeyboardButton(text="🚪 Выйти", callback_data="admin_exit")]
+    ])
+
+    await m.answer(
+        "🛠 <b>Меню администратора</b>\n\n"
+        "Вы можете:\n"
+        "1️⃣ Отправить массовое сообщение всем пользователям\n"
+        "2️⃣ Проверить количество подписчиков\n"
+        "3️⃣ Посмотреть статистику по меткам",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "admin_broadcast")
+async def admin_broadcast_start(call: types.CallbackQuery, state: FSMContext):
+    """Начало массовой рассылки"""
+    if not is_admin(call.from_user):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    await call.message.answer(
+        "📬 <b>Массовая рассылка</b>\n\n"
+        "Введите текст сообщения для рассылки:\n"
+        "(Можно использовать emoji, ссылки и HTML-форматирование)"
+    )
+    await state.set_state(BroadcastStates.waiting_for_message)
+    await call.answer()
+
+@dp.message(BroadcastStates.waiting_for_message)
+async def admin_broadcast_confirm(m: Message, state: FSMContext):
+    """Подтверждение рассылки"""
+    if not is_admin(m.from_user):
+        return
+
+    # Сохраняем текст рассылки
+    await state.update_data(broadcast_text=m.text)
+
+    # Подсчитываем уникальных пользователей
+    all_users = set()
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        user_id = r.get("user_id")
+        if user_id:
+            all_users.add(str(user_id))
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Отправить", callback_data="confirm_broadcast")],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast")]
+    ])
+
+    await m.answer(
+        f"Вы собираетесь отправить сообщение <b>{len(all_users)}</b> пользователям.\n\n"
+        f"<b>Текст сообщения:</b>\n{m.text}\n\n"
+        f"Подтвердить отправку?",
+        reply_markup=kb
+    )
+
+@dp.callback_query(F.data == "confirm_broadcast")
+async def admin_broadcast_send(call: types.CallbackQuery, state: FSMContext):
+    """Отправка рассылки"""
+    if not is_admin(call.from_user):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    data = await state.get_data()
+    broadcast_text = data.get("broadcast_text")
+
+    if not broadcast_text:
+        await call.message.answer("❌ Ошибка: текст сообщения не найден")
+        await call.answer()
+        return
+
+    # Получаем всех уникальных пользователей
+    all_users = set()
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        user_id = r.get("user_id")
+        if user_id:
+            all_users.add(int(user_id))
+
+    await call.message.answer("⏳ Начинаю рассылку...")
+
+    delivered = 0
+    failed = 0
+
+    for user_id in all_users:
+        try:
+            await bot.send_message(user_id, broadcast_text)
+            delivered += 1
+            await asyncio.sleep(0.05)  # Защита от флуда
+        except Exception as e:
+            failed += 1
+            log.warning(f"Не удалось отправить сообщение {user_id}: {e}")
+
+    await call.message.answer(
+        f"✅ Рассылка завершена!\n\n"
+        f"📤 Сообщение успешно отправлено <b>{delivered}</b> пользователям.\n"
+        f"🚫 Ошибок: <b>{failed}</b>."
+    )
+
+    await state.clear()
+    await call.answer()
+
+@dp.callback_query(F.data == "cancel_broadcast")
+async def admin_broadcast_cancel(call: types.CallbackQuery, state: FSMContext):
+    """Отмена рассылки"""
+    await state.clear()
+    await call.message.answer("❌ Рассылка отменена")
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_users")
+async def admin_users_count(call: types.CallbackQuery):
+    """Показать количество пользователей"""
+    if not is_admin(call.from_user):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    all_users = set()
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        user_id = r.get("user_id")
+        if user_id:
+            all_users.add(str(user_id))
+
+    await call.answer(f"👥 Всего пользователей: {len(all_users)}", show_alert=True)
+
+@dp.callback_query(F.data == "admin_stats")
+async def admin_stats(call: types.CallbackQuery):
+    """Статистика по меткам"""
+    if not is_admin(call.from_user):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    # Собираем статистику по меткам
+    labels_stats = defaultdict(int)
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        ref = r.get("ref_source", "")
+        if ref and ref != "direct":
+            base_label, _, _ = parse_label(ref)
+            if base_label:
+                labels_stats[base_label] += 1
+
+    if not labels_stats:
+        await call.message.answer("📊 Статистика по меткам пока пуста")
+        await call.answer()
+        return
+
+    lines = ["📊 <b>Статистика по меткам:</b>\n"]
+    for label, count in sorted(labels_stats.items(), key=lambda x: -x[1]):
+        lines.append(f"• <code>{label}</code>: {count} пользователей")
+
+    await call.message.answer("\n".join(lines))
+    await call.answer()
+
+@dp.callback_query(F.data == "admin_exit")
+async def admin_exit(call: types.CallbackQuery):
+    """Выход из админ-панели"""
+    await call.message.answer("👋 Выход из админ-панели")
+    await call.answer()
+
 # ================== Мониторинг Payments: новые строки -> в админ-чат ==================
 async def monitor_payments():
     """
@@ -799,7 +1273,7 @@ async def main():
     await bot.set_my_commands(user_cmds)
 
     admin_cmds = user_cmds + [
-        BotCommand(command="top", description="Рейтинг ТОП-10"),
+        BotCommand(command="admin", description="Рассылка"),
     ]
     for admin_id in ADMINS:
         if isinstance(admin_id, int):
