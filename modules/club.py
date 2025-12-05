@@ -47,25 +47,31 @@ if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
 
 
 # ===== Google Sheets =====
+def get_sheets_connection():
+    """Получить подключение к Google Sheets"""
+    scopes = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive",
+    ]
+    creds = Credentials.from_service_account_file(SERVICE_JSON_PATH, scopes=scopes)
+    gc = gspread.authorize(creds)
+    return gc.open_by_key(SPREADSHEET_ID)
+
+
 def get_club_worksheet():
     """Получить лист ClubPayments для записи платежей"""
     try:
-        scopes = [
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ]
-        creds = Credentials.from_service_account_file(SERVICE_JSON_PATH, scopes=scopes)
-        gc = gspread.authorize(creds)
-        sh = gc.open_by_key(SPREADSHEET_ID)
+        sh = get_sheets_connection()
 
         # Ищем или создаём лист ClubPayments
         worksheet_list = [ws.title for ws in sh.worksheets()]
         if "ClubPayments" not in worksheet_list:
-            ws = sh.add_worksheet("ClubPayments", rows=1000, cols=12)
-            ws.update("A1:L1", [[
+            ws = sh.add_worksheet("ClubPayments", rows=1000, cols=14)
+            ws.update("A1:N1", [[
                 "timestamp", "user_id", "username", "full_name",
                 "tariff", "price", "payment_id", "status",
-                "start_date", "end_date", "payment_method", "notified"
+                "start_date", "end_date", "payment_method", "ref_source",
+                "referrer_bonus", "notified"
             ]])
         else:
             ws = sh.worksheet("ClubPayments")
@@ -75,10 +81,130 @@ def get_club_worksheet():
         return None
 
 
+def get_users_worksheet():
+    """Получить лист Users для поиска ref_source"""
+    try:
+        sh = get_sheets_connection()
+        return sh.worksheet("Users")
+    except Exception as e:
+        log.error(f"Ошибка получения листа Users: {e}")
+        return None
+
+
+def get_referrals_worksheet():
+    """Получить лист Referrals для записи бонусов"""
+    try:
+        sh = get_sheets_connection()
+        return sh.worksheet("Referrals")
+    except Exception as e:
+        log.error(f"Ошибка получения листа Referrals: {e}")
+        return None
+
+
+def get_bonuses_worksheet():
+    """Получить лист Bonuses для обновления общих бонусов"""
+    try:
+        sh = get_sheets_connection()
+        return sh.worksheet("Bonuses")
+    except Exception as e:
+        log.error(f"Ошибка получения листа Bonuses: {e}")
+        return None
+
+
+def find_user_ref_source(user_id: int) -> str:
+    """Найти ref_source (метку) по которой пришел пользователь"""
+    try:
+        ws = get_users_worksheet()
+        if not ws:
+            return ""
+
+        rows = ws.get_all_records()
+        for r in reversed(rows):
+            if str(r.get("user_id")) == str(user_id):
+                ref = r.get("ref_source") or ""
+                if ref and ref != "direct":
+                    return ref
+        return ""
+    except Exception as e:
+        log.error(f"Ошибка поиска ref_source: {e}")
+        return ""
+
+
+def get_user_id_by_ref(ref_source: str):
+    """Получить user_id и username реферера по ref_source"""
+    try:
+        ws = get_users_worksheet()
+        if not ws:
+            return None, None
+
+        rows = ws.get_all_records()
+        for r in reversed(rows):
+            username = str(r.get("username") or "")
+            uid = str(r.get("user_id") or "")
+
+            if username == ref_source or uid == ref_source:
+                return uid, username
+        return None, None
+    except Exception as e:
+        log.error(f"Ошибка получения user_id по ref: {e}")
+        return None, None
+
+
+def update_bonuses(ref_source: str, bonus: int):
+    """Обновить общие бонусы реферера в листе Bonuses"""
+    try:
+        ws = get_bonuses_worksheet()
+        if not ws:
+            return
+
+        rows = ws.get_all_records()
+        for idx, r in enumerate(rows, start=2):
+            if str(r.get("ref_id")) == str(ref_source):
+                total_refs = int(r.get("total_refs", 0)) + 1
+                total_bonus = int(r.get("total_bonus", 0)) + bonus
+                ws.update(f"B{idx}:D{idx}", [[
+                    total_refs,
+                    total_bonus,
+                    datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+                ]])
+                return
+
+        # Если не найден - добавляем новую строку
+        ws.append_row([
+            ref_source,
+            1,
+            bonus,
+            datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+        ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        log.error(f"Ошибка обновления Bonuses: {e}")
+
+
+def log_referral_bonus(ref_source: str, ref_username: str, user_id: int,
+                       username: str, purchase_type: str, amount: int, bonus: int):
+    """Записать реферальный бонус в лист Referrals"""
+    try:
+        ws = get_referrals_worksheet()
+        if ws:
+            ws.append_row([
+                datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                ref_source,
+                ref_username,
+                user_id,
+                username,
+                purchase_type,
+                amount,
+                bonus
+            ], value_input_option="USER_ENTERED")
+    except Exception as e:
+        log.error(f"Ошибка записи в Referrals: {e}")
+
+
 def log_club_payment_to_sheets(user_id: int, username: str, full_name: str,
                                 tariff: str, price: int, payment_id: str,
                                 status: str, start_date: str, end_date: str,
-                                payment_method: str = "yookassa"):
+                                payment_method: str = "yookassa",
+                                ref_source: str = "", referrer_bonus: int = 0):
     """Записать платеж в Google Sheets"""
     try:
         ws = get_club_worksheet()
@@ -95,6 +221,8 @@ def log_club_payment_to_sheets(user_id: int, username: str, full_name: str,
                 start_date,
                 end_date,
                 payment_method,
+                ref_source,
+                referrer_bonus,
                 "yes"
             ], value_input_option="USER_ENTERED")
             log.info(f"Платеж {payment_id} записан в Google Sheets")
@@ -112,6 +240,58 @@ async def notify_admin_topic(bot: Bot, text: str):
         log.info("Уведомление отправлено в админ-топик")
     except Exception as e:
         log.warning(f"Не удалось отправить в админ-топик: {e}")
+
+
+async def process_referral_bonus(bot: Bot, user_id: int, username: str,
+                                  purchase_type: str, amount: int):
+    """
+    Обработать реферальный бонус при оплате.
+    - Найти по чьей ссылке пришел пользователь
+    - Начислить 25% от суммы
+    - Записать в Referrals и Bonuses
+    - Уведомить реферера
+    """
+    # Находим метку пользователя
+    ref_source = find_user_ref_source(user_id)
+    if not ref_source:
+        log.info(f"Пользователь {user_id} пришёл без реферала (direct)")
+        return "", 0
+
+    # Вычисляем бонус 25%
+    bonus = int(amount * 0.25)
+
+    # Получаем данные реферера
+    referrer_id, referrer_username = get_user_id_by_ref(ref_source)
+
+    # Записываем в лист Referrals
+    log_referral_bonus(
+        ref_source=ref_source,
+        ref_username=referrer_username or "",
+        user_id=user_id,
+        username=username,
+        purchase_type=purchase_type,
+        amount=amount,
+        bonus=bonus
+    )
+
+    # Обновляем общие бонусы в Bonuses
+    update_bonuses(ref_source, bonus)
+
+    # Уведомляем реферера если известен его user_id
+    if referrer_id and str(referrer_id).isdigit():
+        try:
+            await bot.send_message(
+                int(referrer_id),
+                f"🎉 <b>Реферальный бонус!</b>\n\n"
+                f"По вашей ссылке оформлена подписка на Закрытый Клуб!\n"
+                f"💰 Вам начислено: <b>{bonus}₽</b> (25% от {amount}₽)\n\n"
+                f"Спасибо, что приглашаете друзей! 💚"
+            )
+            log.info(f"Реферер {referrer_id} уведомлен о бонусе {bonus}₽")
+        except Exception as e:
+            log.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
+
+    return ref_source, bonus
 
 
 # ===== Тарифы закрытого клуба =====
@@ -634,6 +814,15 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
             end_date = start_date + timedelta(days=tariff["days"])
             end_date_str = end_date.strftime("%d.%m.%Y")
 
+            # Обрабатываем реферальный бонус
+            ref_source, referrer_bonus = await process_referral_bonus(
+                bot=bot,
+                user_id=user.id,
+                username=user.username or "",
+                purchase_type=f"Закрытый клуб: {tariff['label']}",
+                amount=tariff["price"]
+            )
+
             # Сообщение пользователю
             await call.message.edit_text(
                 f"🎉 <b>Оплата успешно прошла!</b>\n\n"
@@ -645,7 +834,7 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
                 ])
             )
 
-            # Записываем в Google Sheets
+            # Записываем в Google Sheets (с ref_source и бонусом)
             log_club_payment_to_sheets(
                 user_id=user.id,
                 username=user.username or "",
@@ -656,12 +845,13 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
                 status="succeeded",
                 start_date=str(start_date),
                 end_date=str(end_date),
-                payment_method="yookassa"
+                payment_method="yookassa",
+                ref_source=ref_source,
+                referrer_bonus=referrer_bonus
             )
 
-            # Уведомление в топик админ-чата
-            await notify_admin_topic(
-                bot,
+            # Формируем текст уведомления с информацией о реферале
+            admin_text = (
                 f"💳 <b>Новая оплата Закрытого Клуба</b>\n\n"
                 f"👤 {user.full_name} (@{user.username or user.id})\n"
                 f"📦 Тариф: {tariff['label']}\n"
@@ -669,6 +859,11 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
                 f"📅 До: {end_date_str}\n"
                 f"🆔 Платеж: <code>{payment_id}</code>"
             )
+            if ref_source:
+                admin_text += f"\n\n👥 Реферал: <code>{ref_source}</code>\n💎 Бонус рефереру: {referrer_bonus}₽"
+
+            # Уведомление в топик админ-чата
+            await notify_admin_topic(bot, admin_text)
 
             await call.answer("✅ Оплата подтверждена!")
         else:
