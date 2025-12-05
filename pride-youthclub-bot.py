@@ -623,7 +623,8 @@ async def process_referral(user: types.User, purchase_type: str, amount: float):
 #                  FSM для рассылки
 # =========================================================
 class BroadcastStates(StatesGroup):
-    waiting_for_message = State()
+    waiting_for_segment = State()  # выбор сегмента аудитории
+    waiting_for_message = State()  # ввод текста сообщения
 
 
 # =========================================================
@@ -1342,8 +1343,121 @@ async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
         await call.answer("⛔️ Нет доступа", show_alert=True)
         return
 
+    # Подсчитываем аудиторию по сегментам
+    all_users = set()
+    rows = WS_USERS.get_all_records()
+    for r in rows:
+        uid = r.get("user_id")
+        if uid:
+            all_users.add(int(uid))
+
+    # Получаем платящих пользователей из всех источников
+    paid_ever = set()  # хотя бы раз платили
+    club_active = set()  # активная подписка клуба
+
+    # 1. Проверяем Subscriptions (абонементы)
+    try:
+        ws_subs = WS.worksheet("Subscriptions")
+        subs_rows = ws_subs.get_all_records()
+        for r in subs_rows:
+            uid = r.get("user_id")
+            confirmed = str(r.get("confirmed", "")).lower()
+            if uid and confirmed in ("yes", "подтверждено"):
+                paid_ever.add(int(uid))
+    except:
+        pass
+
+    # 2. Проверяем ClubPayments (закрытый клуб)
+    try:
+        ws_club = WS.worksheet("ClubPayments")
+        club_rows = ws_club.get_all_records()
+        from datetime import datetime
+        today = datetime.now().date()
+        for r in club_rows:
+            uid = r.get("user_id")
+            status = str(r.get("status", "")).lower()
+            if uid and status == "succeeded":
+                paid_ever.add(int(uid))
+                # Проверяем активность подписки
+                end_date_str = r.get("end_date", "")
+                if end_date_str:
+                    try:
+                        end_date = datetime.strptime(str(end_date_str), "%Y-%m-%d").date()
+                        if end_date >= today:
+                            club_active.add(int(uid))
+                    except:
+                        pass
+    except:
+        pass
+
+    # 3. Проверяем morphotype (оплаченные морфотипы)
+    try:
+        ws_morpho = WS.worksheet("morphotype")
+        morpho_rows = ws_morpho.get_all_records()
+        for r in morpho_rows:
+            uid = r.get("user_id")
+            confirmed = str(r.get("confirmed", "")).lower()
+            if uid and confirmed == "yes":
+                paid_ever.add(int(uid))
+    except:
+        pass
+
+    # Вычисляем сегменты
+    never_paid = all_users - paid_ever
+    paid_no_club = paid_ever - club_active
+
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"🆓 Никогда не платили ({len(never_paid)})",
+            callback_data="broadcast_segment:never_paid"
+        )],
+        [InlineKeyboardButton(
+            text=f"💳 Платили, но без клуба ({len(paid_no_club)})",
+            callback_data="broadcast_segment:paid_no_club"
+        )],
+        [InlineKeyboardButton(
+            text=f"👑 Активная подписка клуба ({len(club_active)})",
+            callback_data="broadcast_segment:club_active"
+        )],
+        [InlineKeyboardButton(
+            text=f"📢 Все пользователи ({len(all_users)})",
+            callback_data="broadcast_segment:all"
+        )],
+        [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")]
+    ])
+
     await call.message.answer(
         "📬 <b>Массовая рассылка</b>\n\n"
+        "Выберите сегмент аудитории:\n\n"
+        f"🆓 <b>Никогда не платили</b> — {len(never_paid)} чел.\n"
+        f"💳 <b>Платили (без активного клуба)</b> — {len(paid_no_club)} чел.\n"
+        f"👑 <b>Активная подписка клуба</b> — {len(club_active)} чел.\n"
+        f"📢 <b>Все пользователи</b> — {len(all_users)} чел.",
+        reply_markup=kb
+    )
+    await state.set_state(BroadcastStates.waiting_for_segment)
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("broadcast_segment:"))
+async def admin_broadcast_segment(call: CallbackQuery, state: FSMContext):
+    if not is_admin(call.from_user):
+        await call.answer("⛔️ Нет доступа", show_alert=True)
+        return
+
+    segment = call.data.split(":")[1]
+    segment_names = {
+        "never_paid": "🆓 Никогда не платили",
+        "paid_no_club": "💳 Платили, но без клуба",
+        "club_active": "👑 Активная подписка клуба",
+        "all": "📢 Все пользователи"
+    }
+
+    await state.update_data(broadcast_segment=segment)
+
+    await call.message.edit_text(
+        f"📬 <b>Массовая рассылка</b>\n\n"
+        f"Сегмент: <b>{segment_names.get(segment, segment)}</b>\n\n"
         "Введите текст сообщения для рассылки:\n"
         "(Можно использовать emoji, ссылки и HTML-форматирование)"
     )
@@ -1351,30 +1465,104 @@ async def admin_broadcast_start(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@dp.message(BroadcastStates.waiting_for_message)
-async def admin_broadcast_confirm(m: Message, state: FSMContext):
-    if not is_admin(m.from_user):
-        return
-
-    await state.update_data(broadcast_text=m.text)
-
-    # считаем получателей
+def get_users_by_segment(segment: str) -> set:
+    """Получить пользователей по сегменту"""
     all_users = set()
     rows = WS_USERS.get_all_records()
     for r in rows:
         uid = r.get("user_id")
         if uid:
-            all_users.add(str(uid))
+            all_users.add(int(uid))
+
+    if segment == "all":
+        return all_users
+
+    # Получаем платящих пользователей
+    paid_ever = set()
+    club_active = set()
+
+    # 1. Subscriptions
+    try:
+        ws_subs = WS.worksheet("Subscriptions")
+        for r in ws_subs.get_all_records():
+            uid = r.get("user_id")
+            confirmed = str(r.get("confirmed", "")).lower()
+            if uid and confirmed in ("yes", "подтверждено"):
+                paid_ever.add(int(uid))
+    except:
+        pass
+
+    # 2. ClubPayments
+    try:
+        ws_club = WS.worksheet("ClubPayments")
+        today = datetime.now().date()
+        for r in ws_club.get_all_records():
+            uid = r.get("user_id")
+            status = str(r.get("status", "")).lower()
+            if uid and status == "succeeded":
+                paid_ever.add(int(uid))
+                end_date_str = r.get("end_date", "")
+                if end_date_str:
+                    try:
+                        end_date = datetime.strptime(str(end_date_str), "%Y-%m-%d").date()
+                        if end_date >= today:
+                            club_active.add(int(uid))
+                    except:
+                        pass
+    except:
+        pass
+
+    # 3. Morphotype
+    try:
+        ws_morpho = WS.worksheet("morphotype")
+        for r in ws_morpho.get_all_records():
+            uid = r.get("user_id")
+            confirmed = str(r.get("confirmed", "")).lower()
+            if uid and confirmed == "yes":
+                paid_ever.add(int(uid))
+    except:
+        pass
+
+    if segment == "never_paid":
+        return all_users - paid_ever
+    elif segment == "paid_no_club":
+        return paid_ever - club_active
+    elif segment == "club_active":
+        return club_active
+
+    return all_users
+
+
+@dp.message(BroadcastStates.waiting_for_message)
+async def admin_broadcast_confirm(m: Message, state: FSMContext):
+    if not is_admin(m.from_user):
+        return
+
+    data = await state.get_data()
+    segment = data.get("broadcast_segment", "all")
+    await state.update_data(broadcast_text=m.text)
+
+    segment_names = {
+        "never_paid": "🆓 Никогда не платили",
+        "paid_no_club": "💳 Платили, но без клуба",
+        "club_active": "👑 Активная подписка клуба",
+        "all": "📢 Все пользователи"
+    }
+
+    # считаем получателей по сегменту
+    target_users = get_users_by_segment(segment)
 
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="✅ Отправить", callback_data="confirm_broadcast")],
-            [InlineKeyboardButton(text="❌ Отмена", callback_data="cancel_broadcast")]
+            [InlineKeyboardButton(text="❌ Отмена", callback_data="broadcast_cancel")]
         ]
     )
 
     await m.answer(
-        f"Вы собираетесь отправить сообщение <b>{len(all_users)}</b> пользователям.\n\n"
+        f"📬 <b>Подтверждение рассылки</b>\n\n"
+        f"Сегмент: <b>{segment_names.get(segment, segment)}</b>\n"
+        f"Получателей: <b>{len(target_users)}</b>\n\n"
         f"<b>Текст сообщения:</b>\n{m.text}\n\n"
         "Подтвердить отправку?",
         reply_markup=kb
@@ -1389,26 +1577,33 @@ async def admin_broadcast_send(call: CallbackQuery, state: FSMContext):
 
     data = await state.get_data()
     broadcast_text = data.get("broadcast_text")
+    segment = data.get("broadcast_segment", "all")
 
     if not broadcast_text:
         await call.message.answer("❌ Ошибка: текст сообщения не найден")
         await call.answer()
         return
 
-    # получаем всех уникальных юзеров
-    all_users = set()
-    rows = WS_USERS.get_all_records()
-    for r in rows:
-        uid = r.get("user_id")
-        if uid:
-            all_users.add(int(uid))
+    segment_names = {
+        "never_paid": "🆓 Никогда не платили",
+        "paid_no_club": "💳 Платили, но без клуба",
+        "club_active": "👑 Активная подписка клуба",
+        "all": "📢 Все пользователи"
+    }
 
-    await call.message.answer("⏳ Начинаю рассылку...")
+    # Получаем пользователей по сегменту
+    target_users = get_users_by_segment(segment)
+
+    await call.message.answer(
+        f"⏳ Начинаю рассылку...\n"
+        f"Сегмент: {segment_names.get(segment, segment)}\n"
+        f"Получателей: {len(target_users)}"
+    )
 
     delivered = 0
     failed = 0
     skipped = 0
-    for uid in all_users:
+    for uid in target_users:
         # Пропускаем пользователей с активным морфотип чатом
         if is_morphotype_chat_active(uid):
             skipped += 1
@@ -1425,6 +1620,7 @@ async def admin_broadcast_send(call: CallbackQuery, state: FSMContext):
 
     await call.message.answer(
         "✅ Рассылка завершена!\n\n"
+        f"📊 Сегмент: <b>{segment_names.get(segment, segment)}</b>\n"
         f"📤 Успешно: <b>{delivered}</b>\n"
         f"🚫 Ошибок: <b>{failed}</b>\n"
         f"⏭️ Пропущено (морфотип чат): <b>{skipped}</b>"
@@ -1434,7 +1630,7 @@ async def admin_broadcast_send(call: CallbackQuery, state: FSMContext):
     await call.answer()
 
 
-@dp.callback_query(F.data == "cancel_broadcast")
+@dp.callback_query(F.data == "broadcast_cancel")
 async def admin_broadcast_cancel(call: CallbackQuery, state: FSMContext):
     await state.clear()
     await call.message.answer("❌ Рассылка отменена")
