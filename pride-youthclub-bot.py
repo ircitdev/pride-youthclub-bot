@@ -57,6 +57,21 @@ from modules.subscriptions import (
     retry_payment as sub_retry,
     emulate_payment as sub_emulate,
 )
+from modules.club import (
+    show_club_menu,
+    show_tariffs as club_show_tariffs,
+    choose_tariff as club_choose_tariff,
+    pay_yookassa as club_pay_yookassa,
+    check_payment as club_check_payment,
+    pay_sbp as club_pay_sbp,
+    sbp_done as club_sbp_done,
+    admin_confirm as club_admin_confirm,
+    admin_reject as club_admin_reject,
+    show_my_subscription as club_my_sub,
+    about_club,
+    check_subscriptions_task,
+    has_active_subscription,
+)
 
 
 # =========================================================
@@ -1209,6 +1224,87 @@ async def subscribe_cmd(m: Message, state: FSMContext):
 
 
 # =========================================================
+#                 /club - Закрытый клуб
+# =========================================================
+@dp.message(Command("club"))
+async def club_cmd(m: Message, state: FSMContext):
+    """Команда /club для закрытого клуба"""
+    await show_club_menu(bot, m, state)
+
+
+# Club callbacks
+@dp.callback_query(F.data == "club_join")
+async def _club_join(call: CallbackQuery, state: FSMContext):
+    await club_show_tariffs(bot, call, state)
+
+
+@dp.callback_query(F.data == "club_extend")
+async def _club_extend(call: CallbackQuery, state: FSMContext):
+    await club_show_tariffs(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_tariff:"))
+async def _club_tariff(call: CallbackQuery, state: FSMContext):
+    await club_choose_tariff(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_yookassa:"))
+async def _club_yookassa(call: CallbackQuery, state: FSMContext):
+    await club_pay_yookassa(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_check:"))
+async def _club_check(call: CallbackQuery, state: FSMContext):
+    await club_check_payment(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_sbp:"))
+async def _club_sbp(call: CallbackQuery, state: FSMContext):
+    await club_pay_sbp(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_sbp_done:"))
+async def _club_sbp_done(call: CallbackQuery, state: FSMContext):
+    await club_sbp_done(bot, call, state)
+
+
+@dp.callback_query(F.data.startswith("club_admin_confirm:"))
+async def _club_admin_confirm(call: CallbackQuery):
+    await club_admin_confirm(bot, call)
+
+
+@dp.callback_query(F.data.startswith("club_admin_reject:"))
+async def _club_admin_reject(call: CallbackQuery):
+    await club_admin_reject(bot, call)
+
+
+@dp.callback_query(F.data == "club_my_sub")
+async def _club_my_sub(call: CallbackQuery):
+    await club_my_sub(bot, call)
+
+
+@dp.callback_query(F.data == "club_about")
+async def _club_about(call: CallbackQuery):
+    await about_club(bot, call)
+
+
+@dp.callback_query(F.data == "club_back")
+async def _club_back(call: CallbackQuery, state: FSMContext):
+    """Возврат в главное меню клуба"""
+    # Создаем фейковое сообщение для show_club_menu
+    await call.message.delete()
+    # Отправляем новое сообщение с меню клуба
+    class FakeMessage:
+        def __init__(self, user, answer_func):
+            self.from_user = user
+            self.answer = answer_func
+
+    fake_msg = FakeMessage(call.from_user, call.message.answer)
+    await show_club_menu(bot, fake_msg, state)
+    await call.answer()
+
+
+# =========================================================
 #               АДМИН-ПАНЕЛЬ /admin
 # =========================================================
 @dp.message(Command("admin"))
@@ -1584,6 +1680,7 @@ async def forward_topic_to_user(m: Message):
 async def main():
     # Команды для обычных пользователей
     user_cmds = [
+        BotCommand(command="club", description="🏆 Закрытый клуб"),
         BotCommand(command="morphotype", description="📸 Узнать свой морфотип"),
         BotCommand(command="subscribe", description="🔒 Купить абонемент"),
         BotCommand(command="invite", description="👭 Мои ссылки"),
@@ -1609,6 +1706,9 @@ async def main():
 
     # Запускаем мониторинг платежей (новые строки в таблице)
     asyncio.create_task(monitor_payments())
+
+    # Запускаем мониторинг подписок клуба (напоминания и удаление)
+    asyncio.create_task(check_subscriptions_task(bot))
 
     # Запускаем поллинг
     await dp.start_polling(bot)
