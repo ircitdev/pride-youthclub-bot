@@ -282,12 +282,13 @@ async def process_referral_bonus(bot: Bot, user_id: int, username: str,
         try:
             await bot.send_message(
                 int(referrer_id),
-                f"🎉 <b>Реферальный бонус!</b>\n\n"
-                f"По вашей ссылке оформлена подписка на Закрытый Клуб!\n"
-                f"💰 Вам начислено: <b>{bonus}₽</b> (25% от {amount}₽)\n\n"
+                f"🎉 <b>Новая оплата по вашей ссылке!</b>\n\n"
+                f"👤 Пользователь оформил: <b>{purchase_type}</b>\n"
+                f"💵 Сумма покупки: <b>{amount}₽</b>\n"
+                f"💰 Ваш бонус (25%): <b>{bonus}₽</b>\n\n"
                 f"Спасибо, что приглашаете друзей! 💚"
             )
-            log.info(f"Реферер {referrer_id} уведомлен о бонусе {bonus}₽")
+            log.info(f"Реферер {referrer_id} уведомлен о платеже {amount}₽ и бонусе {bonus}₽")
         except Exception as e:
             log.warning(f"Не удалось уведомить реферера {referrer_id}: {e}")
 
