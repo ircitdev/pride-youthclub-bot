@@ -63,10 +63,6 @@ from modules.club import (
     choose_tariff as club_choose_tariff,
     pay_yookassa as club_pay_yookassa,
     check_payment as club_check_payment,
-    pay_sbp as club_pay_sbp,
-    sbp_done as club_sbp_done,
-    admin_confirm as club_admin_confirm,
-    admin_reject as club_admin_reject,
     show_my_subscription as club_my_sub,
     about_club,
     check_subscriptions_task,
@@ -1256,26 +1252,6 @@ async def _club_yookassa(call: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data.startswith("club_check:"))
 async def _club_check(call: CallbackQuery, state: FSMContext):
     await club_check_payment(bot, call, state)
-
-
-@dp.callback_query(F.data.startswith("club_sbp:"))
-async def _club_sbp(call: CallbackQuery, state: FSMContext):
-    await club_pay_sbp(bot, call, state)
-
-
-@dp.callback_query(F.data.startswith("club_sbp_done:"))
-async def _club_sbp_done(call: CallbackQuery, state: FSMContext):
-    await club_sbp_done(bot, call, state)
-
-
-@dp.callback_query(F.data.startswith("club_admin_confirm:"))
-async def _club_admin_confirm(call: CallbackQuery):
-    await club_admin_confirm(bot, call)
-
-
-@dp.callback_query(F.data.startswith("club_admin_reject:"))
-async def _club_admin_reject(call: CallbackQuery):
-    await club_admin_reject(bot, call)
 
 
 @dp.callback_query(F.data == "club_my_sub")

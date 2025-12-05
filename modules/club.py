@@ -1,10 +1,11 @@
 """
 Модуль закрытого клуба с:
 - SQLite база данных для хранения подписок
-- Интеграция ЮКасса для оплаты
+- Интеграция ЮКасса для автоматической оплаты
 - Контроль доступа к закрытому чату
 - Напоминания об истечении подписки
 - Автоматическое удаление из чата при окончании подписки
+- Уведомления в админ-топик и запись в Google Sheets
 """
 
 import os
@@ -13,12 +14,14 @@ import logging
 import asyncio
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Tuple
+from typing import Optional, List
 
+import gspread
+from google.oauth2.service_account import Credentials
 from aiogram import Bot, types
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, ChatPermissions
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 from yookassa import Configuration, Payment
 from dotenv import load_dotenv
 
@@ -32,13 +35,84 @@ YOOKASSA_SECRET_KEY = os.getenv("YOOKASSA_SECRET_KEY_CLUB") or os.getenv("YOOKAS
 CLOSED_GROUP_ID = int(os.getenv("CLOSED_GROUP_ID", "0"))
 CLOSED_CHAT_LINK = os.getenv("CLOSED_CHAT_LINK", "")
 ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0"))
-PAY_PHONE = "+79093802552"
+ADMIN_THREAD_ID = int(os.getenv("ADMIN_THREAD_ID", "0"))
+SERVICE_JSON_PATH = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON") or os.getenv("SERVICE_JSON_PATH")
+SPREADSHEET_ID = os.getenv("SPREADSHEET_ID")
 DB_PATH = os.getenv("CLUB_DB_PATH", "club.db")
 
 # Настраиваем YooKassa
 if YOOKASSA_SHOP_ID and YOOKASSA_SECRET_KEY:
     Configuration.account_id = YOOKASSA_SHOP_ID
     Configuration.secret_key = YOOKASSA_SECRET_KEY
+
+
+# ===== Google Sheets =====
+def get_club_worksheet():
+    """Получить лист ClubPayments для записи платежей"""
+    try:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_file(SERVICE_JSON_PATH, scopes=scopes)
+        gc = gspread.authorize(creds)
+        sh = gc.open_by_key(SPREADSHEET_ID)
+
+        # Ищем или создаём лист ClubPayments
+        worksheet_list = [ws.title for ws in sh.worksheets()]
+        if "ClubPayments" not in worksheet_list:
+            ws = sh.add_worksheet("ClubPayments", rows=1000, cols=12)
+            ws.update("A1:L1", [[
+                "timestamp", "user_id", "username", "full_name",
+                "tariff", "price", "payment_id", "status",
+                "start_date", "end_date", "payment_method", "notified"
+            ]])
+        else:
+            ws = sh.worksheet("ClubPayments")
+        return ws
+    except Exception as e:
+        log.error(f"Ошибка подключения к Google Sheets: {e}")
+        return None
+
+
+def log_club_payment_to_sheets(user_id: int, username: str, full_name: str,
+                                tariff: str, price: int, payment_id: str,
+                                status: str, start_date: str, end_date: str,
+                                payment_method: str = "yookassa"):
+    """Записать платеж в Google Sheets"""
+    try:
+        ws = get_club_worksheet()
+        if ws:
+            ws.append_row([
+                datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds"),
+                user_id,
+                username,
+                full_name,
+                tariff,
+                price,
+                payment_id,
+                status,
+                start_date,
+                end_date,
+                payment_method,
+                "yes"
+            ], value_input_option="USER_ENTERED")
+            log.info(f"Платеж {payment_id} записан в Google Sheets")
+    except Exception as e:
+        log.error(f"Ошибка записи в Google Sheets: {e}")
+
+
+async def notify_admin_topic(bot: Bot, text: str):
+    """Отправить уведомление в топик админ-чата"""
+    try:
+        if ADMIN_THREAD_ID:
+            await bot.send_message(ADMIN_CHAT_ID, text, message_thread_id=ADMIN_THREAD_ID)
+        else:
+            await bot.send_message(ADMIN_CHAT_ID, text)
+        log.info("Уведомление отправлено в админ-топик")
+    except Exception as e:
+        log.warning(f"Не удалось отправить в админ-топик: {e}")
+
 
 # ===== Тарифы закрытого клуба =====
 CLUB_TARIFFS = {
@@ -453,15 +527,14 @@ async def choose_tariff(bot: Bot, call: types.CallbackQuery, state: FSMContext):
     await state.update_data(tariff_key=tariff_key, tariff=tariff)
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="💳 Оплатить картой (YooKassa)", callback_data=f"club_yookassa:{tariff_key}")],
-        [InlineKeyboardButton(text="📱 Оплатить через СБП", callback_data=f"club_sbp:{tariff_key}")],
+        [InlineKeyboardButton(text="💳 Оплатить картой", callback_data=f"club_yookassa:{tariff_key}")],
         [InlineKeyboardButton(text="🔙 Назад к тарифам", callback_data="club_join")]
     ])
 
     await call.message.edit_text(
         f"💎 Вы выбрали: <b>{tariff['label']}</b>\n"
         f"💰 Стоимость: <b>{tariff['price']}₽</b>\n\n"
-        f"Выберите способ оплаты 👇",
+        f"Нажмите «Оплатить картой» для перехода к оплате 👇",
         reply_markup=kb
     )
     await call.answer()
@@ -547,6 +620,8 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
         await call.answer("Ошибка тарифа", show_alert=True)
         return
 
+    user = call.from_user
+
     try:
         payment = Payment.find_one(payment_id)
 
@@ -555,26 +630,44 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
             confirm_subscription(sub_id, tariff["days"])
             update_payment_status(payment_id, "succeeded")
 
-            end_date = (datetime.now().date() + timedelta(days=tariff["days"])).strftime("%d.%m.%Y")
+            start_date = datetime.now().date()
+            end_date = start_date + timedelta(days=tariff["days"])
+            end_date_str = end_date.strftime("%d.%m.%Y")
 
+            # Сообщение пользователю
             await call.message.edit_text(
                 f"🎉 <b>Оплата успешно прошла!</b>\n\n"
                 f"✅ Тариф: {tariff['label']}\n"
-                f"📅 Действует до: {end_date}\n\n"
+                f"📅 Действует до: {end_date_str}\n\n"
                 f"Добро пожаловать в Закрытый Клуб! 💚",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
                     [InlineKeyboardButton(text="🔗 Перейти в клуб", url=CLOSED_CHAT_LINK)]
                 ])
             )
 
-            # Уведомление админу
-            await bot.send_message(
-                ADMIN_CHAT_ID,
-                f"💳 <b>Новая оплата клуба</b>\n\n"
-                f"👤 {call.from_user.full_name} (@{call.from_user.username or call.from_user.id})\n"
+            # Записываем в Google Sheets
+            log_club_payment_to_sheets(
+                user_id=user.id,
+                username=user.username or "",
+                full_name=user.full_name,
+                tariff=tariff["label"],
+                price=tariff["price"],
+                payment_id=payment_id,
+                status="succeeded",
+                start_date=str(start_date),
+                end_date=str(end_date),
+                payment_method="yookassa"
+            )
+
+            # Уведомление в топик админ-чата
+            await notify_admin_topic(
+                bot,
+                f"💳 <b>Новая оплата Закрытого Клуба</b>\n\n"
+                f"👤 {user.full_name} (@{user.username or user.id})\n"
                 f"📦 Тариф: {tariff['label']}\n"
                 f"💰 Сумма: {tariff['price']}₽\n"
-                f"📅 До: {end_date}"
+                f"📅 До: {end_date_str}\n"
+                f"🆔 Платеж: <code>{payment_id}</code>"
             )
 
             await call.answer("✅ Оплата подтверждена!")
@@ -594,154 +687,6 @@ async def check_payment(bot: Bot, call: types.CallbackQuery, state: FSMContext):
     except Exception as e:
         log.error(f"Check payment error: {e}")
         await call.answer("Ошибка проверки платежа", show_alert=True)
-
-
-async def pay_sbp(bot: Bot, call: types.CallbackQuery, state: FSMContext):
-    """Оплата через СБП (ручной перевод)"""
-    tariff_key = call.data.split(":")[1]
-    tariff = CLUB_TARIFFS.get(tariff_key)
-    user = call.from_user
-
-    if not tariff:
-        await call.answer("Ошибка тарифа", show_alert=True)
-        return
-
-    # Создаем подписку в БД
-    sub_id = add_subscription(
-        user_id=user.id,
-        username=user.username or "",
-        full_name=user.full_name,
-        tariff=tariff["label"],
-        price=tariff["price"],
-        payment_method="sbp"
-    )
-
-    await state.update_data(sub_id=sub_id, tariff_key=tariff_key)
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Я оплатил(а)", callback_data=f"club_sbp_done:{sub_id}:{tariff_key}")],
-        [InlineKeyboardButton(text="🔙 Назад", callback_data="club_join")]
-    ])
-
-    await call.message.edit_text(
-        f"📱 <b>Оплата через СБП</b>\n\n"
-        f"Переведите <b>{tariff['price']}₽</b> по номеру:\n"
-        f"📞 <code>{PAY_PHONE}</code>\n\n"
-        f"В комментарии укажите: <code>Клуб {user.id}</code>\n\n"
-        f"После оплаты нажмите «Я оплатил(а)» 👇",
-        reply_markup=kb
-    )
-    await call.answer()
-
-
-async def sbp_done(bot: Bot, call: types.CallbackQuery, state: FSMContext):
-    """Пользователь подтвердил перевод"""
-    parts = call.data.split(":")
-    sub_id = int(parts[1])
-    tariff_key = parts[2]
-    tariff = CLUB_TARIFFS.get(tariff_key)
-    user = call.from_user
-
-    await call.message.edit_text(
-        "💌 <b>Ожидайте подтверждения</b>\n\n"
-        "Администратор проверит платеж и подтвердит вашу подписку.\n"
-        "Обычно это занимает от 5 минут до 1 часа."
-    )
-
-    # Уведомление админу
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"club_admin_confirm:{sub_id}:{tariff_key}")],
-        [InlineKeyboardButton(text="❌ Отклонить", callback_data=f"club_admin_reject:{sub_id}")]
-    ])
-
-    await bot.send_message(
-        ADMIN_CHAT_ID,
-        f"💳 <b>Запрос на подтверждение оплаты клуба</b>\n\n"
-        f"👤 {user.full_name} (@{user.username or user.id})\n"
-        f"📦 Тариф: {tariff['label']}\n"
-        f"💰 Сумма: {tariff['price']}₽\n"
-        f"📱 Метод: СБП\n\n"
-        f"Проверьте получение средств и подтвердите.",
-        reply_markup=kb
-    )
-
-    await call.answer("Заявка отправлена на проверку")
-
-
-async def admin_confirm(bot: Bot, call: types.CallbackQuery):
-    """Админ подтверждает оплату"""
-    parts = call.data.split(":")
-    sub_id = int(parts[1])
-    tariff_key = parts[2]
-    tariff = CLUB_TARIFFS.get(tariff_key)
-
-    sub = get_subscription_by_id(sub_id)
-    if not sub:
-        await call.answer("Подписка не найдена", show_alert=True)
-        return
-
-    # Подтверждаем подписку
-    confirm_subscription(sub_id, tariff["days"])
-
-    end_date = (datetime.now().date() + timedelta(days=tariff["days"])).strftime("%d.%m.%Y")
-
-    # Уведомляем пользователя
-    try:
-        await bot.send_message(
-            sub["user_id"],
-            f"🎉 <b>Оплата подтверждена!</b>\n\n"
-            f"✅ Тариф: {tariff['label']}\n"
-            f"📅 Действует до: {end_date}\n\n"
-            f"Добро пожаловать в Закрытый Клуб! 💚",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🔗 Перейти в клуб", url=CLOSED_CHAT_LINK)]
-            ])
-        )
-    except Exception as e:
-        log.warning(f"Не удалось уведомить пользователя {sub['user_id']}: {e}")
-
-    await call.message.edit_text(
-        f"✅ <b>Подписка подтверждена</b>\n\n"
-        f"👤 {sub['full_name']} (@{sub['username'] or sub['user_id']})\n"
-        f"📦 Тариф: {tariff['label']}\n"
-        f"📅 До: {end_date}"
-    )
-    await call.answer("Подтверждено")
-
-
-async def admin_reject(bot: Bot, call: types.CallbackQuery):
-    """Админ отклоняет оплату"""
-    parts = call.data.split(":")
-    sub_id = int(parts[1])
-
-    sub = get_subscription_by_id(sub_id)
-    if not sub:
-        await call.answer("Подписка не найдена", show_alert=True)
-        return
-
-    # Помечаем как отклоненную
-    conn = get_db()
-    cursor = conn.cursor()
-    cursor.execute("UPDATE subscriptions SET status = 'rejected' WHERE id = ?", (sub_id,))
-    conn.commit()
-    conn.close()
-
-    # Уведомляем пользователя
-    try:
-        await bot.send_message(
-            sub["user_id"],
-            "❌ <b>Оплата не подтверждена</b>\n\n"
-            "Администратор не обнаружил поступление средств.\n"
-            "Проверьте перевод и попробуйте снова или свяжитесь с поддержкой."
-        )
-    except Exception as e:
-        log.warning(f"Не удалось уведомить пользователя {sub['user_id']}: {e}")
-
-    await call.message.edit_text(
-        f"❌ <b>Подписка отклонена</b>\n\n"
-        f"👤 {sub['full_name']} (@{sub['username'] or sub['user_id']})"
-    )
-    await call.answer("Отклонено")
 
 
 async def show_my_subscription(bot: Bot, call: types.CallbackQuery):
